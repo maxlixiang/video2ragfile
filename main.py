@@ -273,8 +273,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 domain=metadata["domain"],
                 transcript_text=transcript_text,
             )
+            logging.info(
+                "Knowledge card body ready before write: has_topic_normalization=%s has_core_viewpoints=%s preview=%r",
+                "## 主题归一化" in card_body,
+                "## 核心观点对象" in card_body,
+                card_body[:300],
+            )
 
             card_content = build_knowledge_card_text(metadata, card_body)
+            logging.info(
+                "Knowledge card content ready for file write: has_topic_normalization=%s has_core_viewpoints=%s preview=%r",
+                "## 主题归一化" in card_content,
+                "## 核心观点对象" in card_content,
+                card_content[:300],
+            )
             clean_filename = build_knowledge_card_filename(metadata)
             txt_filepath = filepath_base + ".txt"
 
