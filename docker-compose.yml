@@ -1,0 +1,11 @@
+services:
+  tg_media_bot:
+    build: .
+    container_name: video_downloader_bot
+    restart: unless-stopped
+
+    volumes:
+      - ./cookies.txt:/app/cookies.txt:ro
+
+    env_file:
+      - .env
