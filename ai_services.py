@@ -1,4 +1,5 @@
 import logging
+import re
 from urllib.parse import urlparse
 
 from openai import AsyncOpenAI
@@ -15,6 +16,17 @@ TRANSCRIPT_PROMPT_LIMIT = 18000
 ALLOWED_DOMAINS = {"geopolitics", "markets", "tech", "general"}
 ALLOWED_SOURCE_PLATFORMS = {"youtube", "article", "podcast", "speech", "manual"}
 ALLOWED_LANGUAGES = {"zh", "en"}
+EXPECTED_CARD_SECTIONS = [
+    "## 主题归一化",
+    "## 核心观点对象",
+    "## 本期核心事实",
+    "## 专家主要观点",
+    "## 专家的判断框架",
+    "## 对当前国际局势/市场的影响",
+    "## 后续观察点",
+    "## 适用检索关键词",
+    "## 不确定性与保留意见",
+]
 
 
 async def process_groq_transcription(file_path: str) -> str:
@@ -142,40 +154,275 @@ def _build_keyword_fallback(metadata: dict, domain: str, source_platform: str) -
     return ", ".join(deduped[:8])
 
 
-def _fallback_card(error_message: str = "") -> str:
-    headline = f"❌ {error_message}" if error_message else ""
-    return (
-        "## 主题归一化\n\n"
-        "topic_key:\n"
-        "topic_family:\n"
-        "source_platform:\n"
-        "language:\n\n"
-        "## 核心观点对象\n\n"
-        "- [thesis]\n\n"
-        "## 本期核心事实\n\n"
-        f"{headline}\n\n"
-        "## 专家主要观点\n\n"
-        "## 专家的判断框架\n\n"
-        "## 对当前国际局势/市场的影响\n\n"
-        "## 后续观察点\n\n"
-        "## 适用检索关键词\n\n"
-        "## 不确定性与保留意见"
-    ).strip()
+def _slugify_token(text: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", (text or "").strip().lower())
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    return normalized
 
 
-def _ensure_keyword_section(card_text: str, fallback_keywords: str) -> str:
+def _keyword_tokens_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    tokens: list[str] = []
+    for part in text.split(","):
+        cleaned = _slugify_token(part)
+        if cleaned and cleaned not in tokens:
+            tokens.append(cleaned)
+    return tokens
+
+
+def _derive_topic_family(metadata: dict, domain: str, fallback_keywords: str) -> str:
+    source_text = " ".join(
+        [
+            str(metadata.get("title", "")).lower(),
+            str(metadata.get("source_type", "")).lower(),
+            domain.lower(),
+            fallback_keywords.lower(),
+        ]
+    )
+
+    if any(token in source_text for token in ("silver", "gold", "bullion", "precious_metals")):
+        return "precious_metals"
+    if any(token in source_text for token in ("commodity", "commodities", "copper", "agriculture")):
+        return "commodities"
+    if any(token in source_text for token in ("ukraine", "russia", "europe", "eu", "nato")):
+        return "europe_geopolitics"
+    if any(token in source_text for token in ("ai", "chip", "semiconductor", "data_center", "cloud", "gpu")):
+        return "ai_infrastructure"
+    if any(token in source_text for token in ("oil", "gas", "lng", "hormuz", "energy")):
+        return "energy_security"
+    if domain == "markets":
+        return "macro_markets"
+    if domain == "geopolitics":
+        return "global_geopolitics"
+    if domain == "tech":
+        return "technology_strategy"
+    return "general_analysis"
+
+
+def _derive_topic_key(metadata: dict, domain: str, fallback_keywords: str, topic_family: str) -> str:
+    title = str(metadata.get("title", "")).lower()
+    title_tokens = re.findall(r"[a-z0-9]+", title)
+    stopwords = {
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "into",
+        "about",
+        "after",
+        "before",
+        "video",
+        "podcast",
+        "interview",
+        "update",
+        "market",
+        "markets",
+        "expert",
+        "talk",
+        "news",
+        "why",
+        "what",
+        "how",
+    }
+
+    ranked_tokens = [token for token in title_tokens if len(token) > 2 and token not in stopwords]
+    keyword_tokens = _keyword_tokens_from_text(fallback_keywords)
+    for token in keyword_tokens:
+        if token not in ranked_tokens:
+            ranked_tokens.append(token)
+
+    prioritized_groups = [
+        ("silver", "supply", "deficit"),
+        ("gold", "reserve"),
+        ("ukraine", "russia"),
+        ("eu", "ukraine"),
+        ("ai", "chip"),
+        ("google", "ai"),
+        ("oil", "supply"),
+        ("natural_gas", "supply"),
+    ]
+    for group in prioritized_groups:
+        if all(any(part == token or part in token for token in ranked_tokens) for part in group):
+            return "_".join(group)
+
+    selected: list[str] = []
+    for token in ranked_tokens:
+        cleaned = _slugify_token(token)
+        if cleaned and cleaned not in selected:
+            selected.append(cleaned)
+        if len(selected) == 3:
+            break
+
+    if not selected:
+        if topic_family.endswith("_analysis"):
+            return topic_family.replace("_analysis", "_topic")
+        return f"{topic_family}_topic"
+    return "_".join(selected[:3])
+
+
+def _extract_sections(card_text: str) -> tuple[dict[str, str], str]:
+    pattern = re.compile(r"(?ms)^(## [^\n]+)\n(.*?)(?=^## |\Z)")
+    sections: dict[str, str] = {}
+    for match in pattern.finditer(card_text.strip()):
+        heading = match.group(1).strip()
+        body = match.group(2).strip()
+        sections[heading] = body
+
+    remainder = pattern.sub("", card_text.strip()).strip()
+    return sections, remainder
+
+
+def _split_sentences(text: str) -> list[str]:
+    normalized = re.sub(r"[\r\n]+", "\n", text or "")
+    chunks = re.split(r"[\n。！？!?；;]+", normalized)
+    sentences: list[str] = []
+    for chunk in chunks:
+        cleaned = re.sub(r"^[\-\*\d\.\)\s]+", "", chunk).strip(" -\t")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if len(cleaned) >= 10 and cleaned not in sentences:
+            sentences.append(cleaned)
+    return sentences
+
+
+def _classify_view_type(sentence: str) -> str:
+    lowered = sentence.lower()
+    methodology_tokens = ("framework", "method", "indicator", "watch", "track", "observe", "维度", "框架", "指标", "观察", "判断")
+    event_tokens = ("risk", "trigger", "squeeze", "breakout", "shock", "event", "催化", "风险", "事件", "冲击", "爆发")
+    tactical_tokens = ("current", "near term", "short term", "this year", "next", "近期", "当前", "阶段", "短期", "未来几个月")
+    if any(token in lowered for token in methodology_tokens):
+        return "methodology"
+    if any(token in lowered for token in event_tokens):
+        return "event_call"
+    if any(token in lowered for token in tactical_tokens):
+        return "tactical_view"
+    return "thesis"
+
+
+def _build_core_viewpoints_fallback(sections: dict[str, str]) -> str:
+    source_blocks = [
+        sections.get("## 专家主要观点", ""),
+        sections.get("## 专家的判断框架", ""),
+        sections.get("## 对当前国际局势/市场的影响", ""),
+    ]
+    candidates: list[str] = []
+    for block in source_blocks:
+        for sentence in _split_sentences(block):
+            if sentence not in candidates:
+                candidates.append(sentence)
+
+    fallback_lines: list[str] = []
+    for sentence in candidates[:5]:
+        fallback_lines.append(f"- [{_classify_view_type(sentence)}] {sentence}")
+
+    while len(fallback_lines) < 3:
+        seeds = [
+            "- [thesis] 专家围绕当前主题提出了可持续跟踪的核心判断。",
+            "- [methodology] 专家的判断依赖于若干关键指标、背景条件和验证信号。",
+            "- [tactical_view] 当前阶段的市场或局势变化需要结合后续数据继续验证。",
+        ]
+        for seed in seeds:
+            if seed not in fallback_lines:
+                fallback_lines.append(seed)
+            if len(fallback_lines) >= 3:
+                break
+
+    return "\n".join(fallback_lines[:5])
+
+
+def _ensure_topic_normalization_section(
+    sections: dict[str, str],
+    metadata: dict,
+    domain: str,
+    source_platform: str,
+    language: str,
+    fallback_keywords: str,
+) -> None:
+    if sections.get("## 主题归一化", "").strip():
+        return
+
+    topic_family = _derive_topic_family(metadata, domain, fallback_keywords)
+    topic_key = _derive_topic_key(metadata, domain, fallback_keywords, topic_family)
+    sections["## 主题归一化"] = (
+        f"topic_key: {topic_key}\n"
+        f"topic_family: {topic_family}\n"
+        f"source_platform: {source_platform}\n"
+        f"language: {language}"
+    )
+
+
+def _ensure_core_viewpoints_section(sections: dict[str, str]) -> None:
+    if sections.get("## 核心观点对象", "").strip():
+        return
+    sections["## 核心观点对象"] = _build_core_viewpoints_fallback(sections)
+
+
+def _ensure_keyword_section(sections: dict[str, str], fallback_keywords: str) -> None:
     if not fallback_keywords:
-        return card_text
+        return
 
-    marker = "## 适用检索关键词"
-    if marker not in card_text:
-        return card_text
+    current = sections.get("## 适用检索关键词", "").strip()
+    if not current:
+        sections["## 适用检索关键词"] = fallback_keywords
+        return
 
-    head, tail = card_text.split(marker, 1)
-    stripped_tail = tail.lstrip("\n")
-    if stripped_tail.startswith("## ") or not stripped_tail.strip():
-        return f"{head}{marker}\n\n{fallback_keywords}\n\n{stripped_tail}".rstrip()
-    return card_text
+    if current.startswith("## "):
+        sections["## 适用检索关键词"] = fallback_keywords
+
+
+def _rebuild_card_content(sections: dict[str, str], remainder: str) -> str:
+    ordered_parts: list[str] = []
+    for heading in EXPECTED_CARD_SECTIONS:
+        body = sections.get(heading, "").strip()
+        if body:
+            ordered_parts.append(f"{heading}\n\n{body}")
+
+    if remainder:
+        if "## 专家主要观点" in sections and sections.get("## 专家主要观点", "").strip():
+            updated_body = sections["## 专家主要观点"].strip()
+            if remainder not in updated_body:
+                sections["## 专家主要观点"] = f"{updated_body}\n\n{remainder}".strip()
+            ordered_parts = []
+            for heading in EXPECTED_CARD_SECTIONS:
+                body = sections.get(heading, "").strip()
+                if body:
+                    ordered_parts.append(f"{heading}\n\n{body}")
+        else:
+            ordered_parts.append(remainder)
+
+    return "\n\n".join(ordered_parts).strip()
+
+
+def _fallback_card(
+    error_message: str = "",
+    metadata: dict | None = None,
+    domain: str = "general",
+    source_platform: str = "article",
+    language: str = "zh",
+) -> str:
+    headline = f"❌ {error_message}" if error_message else ""
+    metadata = metadata or {}
+    fallback_keywords = _build_keyword_fallback(metadata, domain, source_platform)
+    sections = {
+        "## 本期核心事实": headline,
+        "## 专家主要观点": "",
+        "## 专家的判断框架": "",
+        "## 对当前国际局势/市场的影响": "",
+        "## 后续观察点": "",
+        "## 不确定性与保留意见": "",
+    }
+    _ensure_topic_normalization_section(
+        sections,
+        metadata,
+        domain,
+        source_platform,
+        language,
+        fallback_keywords,
+    )
+    _ensure_core_viewpoints_section(sections)
+    _ensure_keyword_section(sections, fallback_keywords)
+    return _rebuild_card_content(sections, "")
 
 
 async def generate_expert_knowledge_card(
@@ -185,16 +432,22 @@ async def generate_expert_knowledge_card(
     transcript_text: str,
 ) -> str:
     """使用 DeepSeek 将视频文稿整理成兼容知识演化层的专家知识卡片。"""
-    if not DEEPSEEK_API_KEY:
-        return _fallback_card("未配置 DEEPSEEK_API_KEY，无法生成知识卡片。")
-
-    if len((transcript_text or "").strip()) < 10 or "❌" in transcript_text:
-        return transcript_text
-
     normalized_domain = _normalize_business_domain(domain, metadata)
     source_platform = _infer_source_platform(metadata)
     language = _infer_language(metadata, transcript_text)
     fallback_keywords = _build_keyword_fallback(metadata, normalized_domain, source_platform)
+
+    if not DEEPSEEK_API_KEY:
+        return _fallback_card(
+            "未配置 DEEPSEEK_API_KEY，无法生成知识卡片。",
+            metadata=metadata,
+            domain=normalized_domain,
+            source_platform=source_platform,
+            language=language,
+        )
+
+    if len((transcript_text or "").strip()) < 10 or "❌" in transcript_text:
+        return transcript_text
 
     truncated_transcript, was_truncated = _truncate_transcript(transcript_text)
     transcript_notice = (
@@ -319,7 +572,24 @@ transcript 如下：
             temperature=0.2,
         )
         content = (response.choices[0].message.content or "").strip()
-        return _ensure_keyword_section(content, fallback_keywords)
+        sections, remainder = _extract_sections(content)
+        _ensure_topic_normalization_section(
+            sections,
+            metadata,
+            normalized_domain,
+            source_platform,
+            language,
+            fallback_keywords,
+        )
+        _ensure_core_viewpoints_section(sections)
+        _ensure_keyword_section(sections, fallback_keywords)
+        return _rebuild_card_content(sections, remainder)
     except Exception as exc:
         logger.error("DeepSeek 知识卡片生成失败: %s", exc)
-        return _fallback_card(f"知识卡片生成失败: {exc}")
+        return _fallback_card(
+            f"知识卡片生成失败: {exc}",
+            metadata=metadata,
+            domain=normalized_domain,
+            source_platform=source_platform,
+            language=language,
+        )
