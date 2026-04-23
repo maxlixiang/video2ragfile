@@ -107,8 +107,29 @@ def build_tags(metadata: dict, body: str) -> str:
     return ", ".join(tags)
 
 
+def extract_topic_normalization_fields(body: str) -> dict[str, str]:
+    section_text = extract_section_content(body, "主题归一化")
+    fields = {
+        "source_platform": "",
+        "language": "",
+        "topic_key": "",
+        "topic_family": "",
+    }
+
+    for line in section_text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        normalized_key = key.strip().lower()
+        if normalized_key in fields:
+            fields[normalized_key] = value.strip()
+
+    return fields
+
+
 def build_knowledge_card_text(metadata: dict, body: str) -> str:
     tags_line = build_tags(metadata, body)
+    normalized_fields = extract_topic_normalization_fields(body)
     return (
         f"# title: {metadata['title']}\n"
         f"# expert: {metadata['expert']}\n"
@@ -116,7 +137,12 @@ def build_knowledge_card_text(metadata: dict, body: str) -> str:
         f"# source_type: llm_summary_of_youtube_transcript\n"
         f"# original_url: {metadata['original_url']}\n"
         f"# domain: {metadata['domain']}\n"
-        f"# tags: {tags_line}\n\n"
+        f"# source_platform: {normalized_fields['source_platform']}\n"
+        f"# language: {normalized_fields['language']}\n"
+        f"# topic_key: {normalized_fields['topic_key']}\n"
+        f"# topic_family: {normalized_fields['topic_family']}\n"
+        f"# tags: {tags_line}\n"
+        f"# card_version: v2\n\n"
         f"{body.strip()}\n"
     )
 
