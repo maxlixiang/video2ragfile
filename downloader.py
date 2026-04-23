@@ -18,6 +18,25 @@ COOKIE_FILE = "/app/cookies.txt"
 DOUYIN_HOSTS = {"douyin.com", "www.douyin.com", "v.douyin.com", "iesdouyin.com"}
 logger = logging.getLogger(__name__)
 
+DOMAIN_KEYWORDS = {
+    "markets": {
+        "silver", "gold", "market", "markets", "commodity", "commodities", "etf", "inventory",
+        "supply", "demand", "deficit", "squeeze", "solar", "industrial", "macro", "inflation",
+        "rates", "bond", "stocks", "stock", "futures", "oil", "gas", "dollar", "liquidity",
+        "白银", "黄金", "市场", "商品", "大宗", "期货", "现货", "供应", "需求", "短缺", "库存",
+        "挤仓", "太阳能", "工业需求", "通胀", "利率", "债券", "股市", "美元", "原油",
+    },
+    "geopolitics": {
+        "iran", "hormuz", "ceasefire", "war", "ukraine", "russia", "israel", "gaza", "nato",
+        "tariff", "diplomacy", "sanctions", "military", "伊朗", "霍尔木兹", "停火", "战争",
+        "乌克兰", "俄罗斯", "以色列", "加沙", "北约", "关税", "制裁", "地缘", "国际局势",
+    },
+    "tech": {
+        "ai", "artificial intelligence", "chip", "chips", "semiconductor", "software", "openai",
+        "model", "llm", "agent", "机器人", "芯片", "半导体", "软件", "模型", "大模型", "智能体",
+    },
+}
+
 
 def today_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
@@ -83,12 +102,24 @@ def build_topic_from_title(title: str, video_id: str) -> str:
     return sanitize_filename_component(topic.lower(), f"video_{video_id}", max_length=60)
 
 
+def infer_business_domain(title: str, source_domain: str, expert: str | None = None) -> str:
+    haystack = f"{title or ''} {expert or ''} {source_domain or ''}".lower()
+    scores: dict[str, int] = {}
+    for domain_name, keywords in DOMAIN_KEYWORDS.items():
+        scores[domain_name] = sum(1 for keyword in keywords if keyword.lower() in haystack)
+
+    best_domain = max(scores, key=scores.get, default="general")
+    if scores.get(best_domain, 0) > 0:
+        return best_domain
+    return "general"
+
+
 def build_metadata(
     *,
     title: str | None,
     upload_date: str | None,
     original_url: str,
-    domain: str,
+    source_domain: str,
     expert: str | None,
     video_id: str | None,
 ) -> dict:
@@ -100,7 +131,8 @@ def build_metadata(
         "title": safe_title,
         "upload_date": normalize_upload_date(upload_date),
         "original_url": original_url,
-        "domain": domain,
+        "domain": infer_business_domain(safe_title, source_domain, safe_expert),
+        "source_domain": source_domain,
         "expert": safe_expert,
         "video_id": safe_video_id,
         "topic": build_topic_from_title(safe_title, safe_video_id),
@@ -147,7 +179,7 @@ def download_douyin_media(url: str, filepath_base: str, is_audio: bool) -> dict:
         title=media_meta.get("title"),
         upload_date=media_meta.get("upload_date"),
         original_url=url,
-        domain="douyin.com",
+        source_domain="douyin.com",
         expert=media_meta.get("expert"),
         video_id=media_meta.get("aweme_id"),
     )
@@ -172,7 +204,7 @@ def download_twitter_media(url: str, filepath_base: str, is_audio: bool) -> dict
         title=media_meta.get("title"),
         upload_date=media_meta.get("upload_date"),
         original_url=url,
-        domain="x.com",
+        source_domain="x.com",
         expert=media_meta.get("expert"),
         video_id=media_meta.get("tweet_id"),
     )
@@ -192,7 +224,7 @@ def download_twitter_media(url: str, filepath_base: str, is_audio: bool) -> dict
 
 
 def extract_generic_metadata(url: str) -> dict:
-    domain = (urlparse(url).hostname or "unknown").lower()
+    source_domain = (urlparse(url).hostname or "unknown").lower()
     try:
         with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -204,7 +236,7 @@ def extract_generic_metadata(url: str) -> dict:
         title=info.get("title"),
         upload_date=info.get("upload_date") or info.get("release_date"),
         original_url=info.get("webpage_url") or url,
-        domain=domain,
+        source_domain=source_domain,
         expert=info.get("uploader") or info.get("channel") or info.get("creator") or info.get("author"),
         video_id=info.get("id"),
     )

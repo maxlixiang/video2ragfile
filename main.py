@@ -71,7 +71,44 @@ def build_send_failure_message(error: Exception) -> str:
     return f"发送失败：未知 Telegram 异常 ({error.__class__.__name__})"
 
 
+def extract_section_content(body: str, section_title: str) -> str:
+    pattern = rf"##\s*{re.escape(section_title)}\s*\n(.*?)(?=\n##\s+|\Z)"
+    match = re.search(pattern, body, flags=re.DOTALL)
+    return match.group(1).strip() if match else ""
+
+
+def normalize_tag_token(token: str) -> str:
+    normalized = token.strip().lower()
+    normalized = re.sub(r"^[\-\*\d\.\)\(、，,;；:\s]+", "", normalized)
+    normalized = re.sub(r"[`'\"“”‘’]+", "", normalized)
+    normalized = re.sub(r"\s+", "_", normalized)
+    normalized = re.sub(r"[^0-9a-z_\-\u4e00-\u9fff]+", "", normalized)
+    normalized = re.sub(r"_+", "_", normalized).strip("_-")
+    return normalized
+
+
+def build_tags(metadata: dict, body: str) -> str:
+    keywords_text = extract_section_content(body, "适用检索关键词")
+    raw_candidates = re.split(r"[\n,，、;/；|]+", keywords_text)
+    tags: list[str] = []
+
+    for candidate in raw_candidates:
+        normalized = normalize_tag_token(candidate)
+        if normalized and normalized not in tags:
+            tags.append(normalized)
+
+    if not tags:
+        fallback_candidates = re.split(r"[_\s]+", metadata.get("topic", ""))
+        for candidate in fallback_candidates[:8]:
+            normalized = normalize_tag_token(candidate)
+            if normalized and normalized not in tags:
+                tags.append(normalized)
+
+    return ", ".join(tags)
+
+
 def build_knowledge_card_text(metadata: dict, body: str) -> str:
+    tags_line = build_tags(metadata, body)
     return (
         f"# title: {metadata['title']}\n"
         f"# expert: {metadata['expert']}\n"
@@ -79,7 +116,7 @@ def build_knowledge_card_text(metadata: dict, body: str) -> str:
         f"# source_type: llm_summary_of_youtube_transcript\n"
         f"# original_url: {metadata['original_url']}\n"
         f"# domain: {metadata['domain']}\n"
-        f"# tags:\n\n"
+        f"# tags: {tags_line}\n\n"
         f"{body.strip()}\n"
     )
 
